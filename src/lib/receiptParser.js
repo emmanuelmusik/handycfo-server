@@ -12,7 +12,7 @@ const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5-5';
 let client;
 function getClient() {
   if (!process.env.ANTHROPIC_API_KEY) {
-    const err = new Error('Receipt scanning is not configured yet (missing ANTHROPIC_API_KEY on the server).');
+    const err = new Error('Receipt scanning is not configured yet (missing XAI_API_KEY or ANTHROPIC_API_KEY on the server).');
     err.status = 503;
     throw err;
   }
@@ -58,7 +58,47 @@ function toContentBlock(buffer, mediaType) {
   return { type: 'image', source: { type: 'base64', media_type: mediaType, data } };
 }
 
-export async function parseReceipt(buffer, mediaType) {
+async function callGrok(buffer, mediaType) {
+  const key = process.env.XAI_API_KEY;
+  const model = process.env.XAI_MODEL || 'grok-4';
+  if (mediaType === 'application/pdf') {
+    const err = new Error('Grok reads photos, not PDFs. Please update the app so PDFs are converted first.');
+    err.status = 400;
+    throw err;
+  }
+  const schemaHint = `Reply with ONLY a JSON object with exactly these keys:
+{"is_receipt": boolean, "merchant": string, "date": "YYYY-MM-DD" or null, "total_amount": number or null, "vat_amount": number or null, "currency": "EUR"|"USD"|"GBP"|other ISO code, "category": one of ${CATEGORIES.join(', ')}, "confidence": "high"|"medium"|"low", "notes": string}`;
+  const res = await fetch('https://api.x.ai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+    body: JSON.stringify({
+      model,
+      temperature: 0,
+      response_format: { type: 'json_object' },
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: `data:${mediaType};base64,${buffer.toString('base64')}`, detail: 'high' } },
+          { type: 'text', text: `${PROMPT}\n\n${schemaHint}` },
+        ],
+      }],
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    console.error('xAI error', res.status, text.slice(0, 500));
+    const err = new Error(res.status === 401 ? 'The Grok API key was rejected.' : 'Grok could not read that document. Please try again.');
+    err.status = res.status === 401 ? 503 : 502;
+    throw err;
+  }
+  const json = await res.json();
+  const content = json.choices?.[0]?.message?.content || '';
+  const match = content.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error('The scan did not return any details.');
+  return JSON.parse(match[0]);
+}
+
+async function callClaude(buffer, mediaType) {
   const response = await getClient().messages.create({
     model: MODEL,
     max_tokens: 1024,
@@ -71,7 +111,11 @@ export async function parseReceipt(buffer, mediaType) {
 
   const block = response.content.find((b) => b.type === 'tool_use');
   if (!block) throw new Error('The scan did not return any details.');
-  const r = block.input;
+  return block.input;
+}
+
+export async function parseReceipt(buffer, mediaType) {
+  const r = process.env.XAI_API_KEY ? await callGrok(buffer, mediaType) : await callClaude(buffer, mediaType);
 
   const currency = String(r.currency || 'EUR').toUpperCase();
   const amount = typeof r.total_amount === 'number' && r.total_amount >= 0 ? r.total_amount : null;

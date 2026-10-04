@@ -14,7 +14,7 @@ const MAX_BYTES = 8 * 1024 * 1024;
 
 // Scan a receipt: read it with AI, store the file, create an inbox row.
 receiptsRouter.post('/receipts/scan', route(async (req, res) => {
-  const { businessId, fileName, mediaType, data } = req.body || {};
+  const { businessId, fileName, mediaType, data, readData, readMediaType } = req.body || {};
   const business = await getOwnedBusiness(req.userId, businessId);
 
   if (!ALLOWED_TYPES.includes(mediaType)) throw httpError(400, 'Please upload a photo (JPG, PNG, WebP) or a PDF.');
@@ -26,7 +26,13 @@ receiptsRouter.post('/receipts/scan', route(async (req, res) => {
 
   let parsed;
   try {
-    parsed = await parseReceipt(buffer, mediaType);
+    // PDFs may come with a rendered page image for readers that cannot take PDFs.
+    const readBuffer = readData ? Buffer.from(readData, 'base64') : buffer;
+    const readType = readData ? readMediaType : mediaType;
+    if (readData && (!ALLOWED_TYPES.includes(readType) || readBuffer.length > MAX_BYTES)) {
+      throw httpError(400, 'The page image sent with the PDF is not valid.');
+    }
+    parsed = await parseReceipt(readBuffer, readType);
   } catch (err) {
     if (err.status) throw err;
     console.error('receipt parse failed:', err);
