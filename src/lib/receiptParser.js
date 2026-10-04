@@ -73,7 +73,6 @@ async function callGrok(buffer, mediaType) {
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
     body: JSON.stringify({
       model,
-      temperature: 0,
       response_format: { type: 'json_object' },
       messages: [{
         role: 'user',
