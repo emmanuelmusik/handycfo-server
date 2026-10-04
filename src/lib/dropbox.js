@@ -86,17 +86,18 @@ export async function completeAuth(code, userId) {
 }
 
 // ---------- Step 3: get a ready-to-use client for a user later ----------
-// Dropbox short-lived access tokens expire in ~4 hours, so most calls
-// need a refresh first. The SDK handles that for us once we give it
-// both tokens — it'll silently refresh and we re-encrypt/store the
-// new access token if it rotates.
+// Dropbox access tokens expire after about 4 hours. The SDK only
+// auto-refreshes when it knows the expiry time, and we don't store
+// one, so we refresh explicitly every time we build a client. That is
+// one extra small request per operation, which is fine at this volume
+// and means a connection never silently goes stale.
 export async function getDropboxClientForUser(userId) {
   const { data: conn, error } = await supabaseAdmin
     .from('storage_connections')
     .select('*')
     .eq('owner_id', userId)
     .eq('provider', 'dropbox')
-    .single();
+    .maybeSingle();
 
   if (error || !conn) {
     throw new Error('No connected Dropbox account for this user');
@@ -109,7 +110,21 @@ export async function getDropboxClientForUser(userId) {
     refreshToken: conn.refresh_token_encrypted ? decrypt(conn.refresh_token_encrypted) : undefined,
   });
 
+  if (conn.refresh_token_encrypted) {
+    await dbxAuth.refreshAccessToken();
+  }
+
   return new Dropbox({ auth: dbxAuth });
+}
+
+export async function hasDropbox(userId) {
+  const { data } = await supabaseAdmin
+    .from('storage_connections')
+    .select('id')
+    .eq('owner_id', userId)
+    .eq('provider', 'dropbox')
+    .maybeSingle();
+  return !!data;
 }
 
 // ---------- Disconnect ----------
@@ -119,7 +134,7 @@ export async function disconnectDropbox(userId) {
     .select('access_token_encrypted')
     .eq('owner_id', userId)
     .eq('provider', 'dropbox')
-    .single();
+    .maybeSingle();
 
   if (conn) {
     try {
@@ -129,9 +144,9 @@ export async function disconnectDropbox(userId) {
         accessToken: decrypt(conn.access_token_encrypted),
       });
       const dbx = new Dropbox({ auth: dbxAuth });
-      await dbx.authTokenRevoke(); // best-effort — don't block disconnect on this
+      await dbx.authTokenRevoke(); // best-effort, don't block disconnect on this
     } catch {
-      // Token may already be invalid/expired — that's fine, we're deleting it anyway.
+      // Token may already be expired or revoked; we are deleting it anyway.
     }
   }
 
@@ -143,20 +158,29 @@ export async function disconnectDropbox(userId) {
 }
 
 // ---------- Upload a receipt into the user's App Folder ----------
-export async function uploadReceipt(userId, fileName, fileBuffer) {
+// `path` is relative to the app folder, e.g. "/Sweet Candles/2026-10-04-receipt.jpg".
+// Dropbox creates missing folders automatically.
+export async function uploadReceipt(userId, path, fileBuffer) {
   const dbx = await getDropboxClientForUser(userId);
   const result = await dbx.filesUpload({
-    path: `/${fileName}`, // App Folder access scopes this to HandyCFO's own folder automatically
+    path,
     contents: fileBuffer,
     mode: { '.tag': 'add' },
     autorename: true,
   });
-  return result.result; // includes id, path_lower, etc. — store result.id as receipt_external_id
+  return result.result; // result.id is what we store as receipt_external_id
 }
 
 // ---------- Get a temporary link to show/download a receipt ----------
 export async function getReceiptLink(userId, dropboxFileId) {
   const dbx = await getDropboxClientForUser(userId);
   const result = await dbx.filesGetTemporaryLink({ path: dropboxFileId });
-  return result.result.link; // expires after a few hours — fetch fresh each time it's needed
+  return result.result.link; // expires after a few hours, so fetch fresh each time
+}
+
+// Used only when the user discards a scan that we just uploaded. We never
+// delete files from someone's Dropbox otherwise.
+export async function deleteDropboxFile(userId, dropboxFileId) {
+  const dbx = await getDropboxClientForUser(userId);
+  await dbx.filesDeleteV2({ path: dropboxFileId });
 }

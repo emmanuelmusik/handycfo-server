@@ -56,3 +56,8 @@ curl -X POST https://your-api.up.railway.app/jobs/reminders/run \
   "delete user" API with the service role key. A few lines, but
   should go behind extra confirmation (e.g. require the user to
   re-enter their password) given it's irreversible.
+
+## Added in this version
+- `migrations/003_receipts_network_account.sql` — run it once in the Supabase SQL editor (after 001 and 002). It adds the private `receipts` storage bucket, new inbox columns, and the lookup used to connect contacts who already use HandyCFO.
+- New environment variable on Railway: `ANTHROPIC_API_KEY` (receipt scanning). Optional: `ANTHROPIC_MODEL`.
+- New routes (all require the signed-in user's token): `POST /receipts/scan`, `GET /inbox/:id/file`, `POST /inbox/:id/confirm`, `DELETE /inbox/:id`, `GET /expenses/:id/receipt`, `DELETE /expenses/:id`, `POST /contacts`, `DELETE /contacts/:id`, `POST /network/refresh`, `POST /messages`, `POST /invoices/:id/send`, `DELETE /businesses/:id`, `POST /account/delete`.

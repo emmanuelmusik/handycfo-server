@@ -3,10 +3,15 @@ import express from 'express';
 import cors from 'cors';
 import cron from 'node-cron';
 import { dropboxAuthRouter } from './routes/dropboxAuth.js';
+import { receiptsRouter } from './routes/receipts.js';
+import { networkRouter } from './routes/network.js';
+import { accountRouter } from './routes/account.js';
 import { runReminderJob } from './jobs/sendInvoiceReminders.js';
 
 const app = express();
-app.use(express.json());
+// Receipt uploads arrive as base64 JSON, so that one route gets a larger body limit.
+app.use('/receipts/scan', express.json({ limit: '14mb' }));
+app.use(express.json({ limit: '100kb' }));
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({ origin: allowedOrigins.length ? allowedOrigins : true }));
@@ -14,6 +19,9 @@ app.use(cors({ origin: allowedOrigins.length ? allowedOrigins : true }));
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 
 app.use(dropboxAuthRouter);
+app.use(receiptsRouter);
+app.use(networkRouter);
+app.use(accountRouter);
 
 // Manual trigger for testing/observability — e.g. an uptime pinger,
 // or just curling it yourself after deploying — without exposing
