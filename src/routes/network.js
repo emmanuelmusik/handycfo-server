@@ -3,6 +3,7 @@ import { requireAuth } from '../lib/auth.js';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
 import { getOwnedContact, getOwnedInvoice, route, httpError } from '../lib/ownership.js';
 import { enforceLimit } from '../lib/rateLimit.js';
+import { sendInvoiceEmail } from '../lib/email.js';
 
 export const networkRouter = Router();
 networkRouter.use(requireAuth);
@@ -128,9 +129,34 @@ networkRouter.post('/invoices/:id/send', route(async (req, res) => {
     await supabaseAdmin.from('invoices').update({ status: 'Sent' }).eq('id', inv.id);
   }
 
+  // Email the invoice to the saved address, once.
+  let emailed = false;
+  let emailError = null;
+  let contact = null;
+  if (inv.client_contact_id) contact = await getOwnedContact(req.userId, inv.client_contact_id);
+  const recipientEmail = inv.client_email || contact?.email || null;
+  if (!recipientEmail) {
+    emailError = 'No email address saved for this client.';
+  } else if (inv.sent_at) {
+    emailed = true; // already emailed earlier
+  } else {
+    try {
+      enforceLimit(`invoice-mail:${req.userId}`, 40, 60 * 60 * 1000);
+      const { data: me } = await supabaseAdmin.auth.admin.getUserById(req.userId);
+      await sendInvoiceEmail({
+        invoice: inv, businessName: inv.businesses.name,
+        recipientEmail, replyTo: me?.user?.email,
+      });
+      await supabaseAdmin.from('invoices').update({ sent_at: new Date().toISOString() }).eq('id', inv.id);
+      emailed = true;
+    } catch (err) {
+      console.error('invoice email failed:', err.message);
+      emailError = 'The invoice was marked as sent, but the email could not be delivered.';
+    }
+  }
+
   let deliveredInApp = false;
-  if (inv.client_contact_id) {
-    const contact = await getOwnedContact(req.userId, inv.client_contact_id);
+  if (contact) {
     if (contact.linked_user_id) {
       const { data: theirBiz } = await supabaseAdmin
         .from('businesses').select('id')
@@ -160,5 +186,5 @@ networkRouter.post('/invoices/:id/send', route(async (req, res) => {
       }
     }
   }
-  res.json({ sent: true, deliveredInApp });
+  res.json({ sent: true, deliveredInApp, emailed, emailError, emailedTo: emailed ? recipientEmail : null });
 }));
