@@ -126,6 +126,11 @@ networkRouter.post('/invoices/:id/send', route(async (req, res) => {
   const inv = await getOwnedInvoice(req.userId, req.params.id);
   if (inv.status === 'Paid') throw httpError(409, 'This invoice is already paid.');
 
+  // The sender chooses where it goes. With no choice given, use both (as before).
+  const channels = req.body?.channels;
+  const wantEmail = Array.isArray(channels) ? channels.includes('email') : true;
+  const wantApp = Array.isArray(channels) ? channels.includes('app') : true;
+
   if (inv.status === 'Draft') {
     await supabaseAdmin.from('invoices').update({ status: 'Sent' }).eq('id', inv.id);
   }
@@ -136,7 +141,9 @@ networkRouter.post('/invoices/:id/send', route(async (req, res) => {
   let contact = null;
   if (inv.client_contact_id) contact = await getOwnedContact(req.userId, inv.client_contact_id);
   const recipientEmail = inv.client_email || contact?.email || null;
-  if (!recipientEmail) {
+  if (!wantEmail) {
+    // not requested
+  } else if (!recipientEmail) {
     emailError = 'No email address saved for this client.';
   } else if (inv.sent_at) {
     emailed = true; // already emailed earlier
@@ -158,7 +165,7 @@ networkRouter.post('/invoices/:id/send', route(async (req, res) => {
   }
 
   let deliveredInApp = false;
-  if (contact) {
+  if (wantApp && contact) {
     if (contact.linked_user_id) {
       const { data: theirBiz } = await supabaseAdmin
         .from('businesses').select('id')
@@ -188,7 +195,10 @@ networkRouter.post('/invoices/:id/send', route(async (req, res) => {
       }
     }
   }
-  res.json({ sent: true, deliveredInApp, emailed, emailError, emailedTo: emailed ? recipientEmail : null });
+  const appError = wantApp && !deliveredInApp
+    ? (contact?.linked_user_id ? 'They have no business set up yet, so it could not be delivered in the app.' : 'This client is not on HandyCFO.')
+    : null;
+  res.json({ sent: true, deliveredInApp, emailed, emailError, appError, emailedTo: emailed ? recipientEmail : null });
 }));
 
 // Download the invoice as a PDF (also what gets attached to the email).
