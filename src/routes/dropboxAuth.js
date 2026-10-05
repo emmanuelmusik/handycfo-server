@@ -1,8 +1,29 @@
 import { Router } from 'express';
 import { requireAuth } from '../lib/auth.js';
-import { buildAuthUrl, completeAuth, verifyState, disconnectDropbox } from '../lib/dropbox.js';
+import { buildAuthUrl, completeAuth, verifyState, returnToFromState, disconnectDropbox } from '../lib/dropbox.js';
 
 export const dropboxAuthRouter = Router();
+
+const allowedOrigins = () => (process.env.ALLOWED_ORIGINS || '').split(',').map((x) => x.trim().replace(/\/$/, '')).filter(Boolean);
+
+// The website the user is on right now (the browser tells us in the Origin
+// header of the call to /start). We send them back there when Dropbox is done,
+// so nobody has to configure a redirect address by hand.
+function currentSite(req) {
+  const origin = String(req.headers.origin || '').replace(/\/$/, '');
+  if (!/^https?:\/\//.test(origin)) return null;
+  const allowed = allowedOrigins();
+  return allowed.length === 0 || allowed.includes(origin) ? origin : null;
+}
+
+function backToApp(result, returnTo) {
+  const base = returnTo
+    || ((process.env[result === 'connected' ? 'DROPBOX_SUCCESS_REDIRECT' : 'DROPBOX_FAILURE_REDIRECT'] || '').startsWith('http')
+      ? null
+      : allowedOrigins()[0]);
+  if (base) return `${base}/?dropbox=${result}`;
+  return process.env[result === 'connected' ? 'DROPBOX_SUCCESS_REDIRECT' : 'DROPBOX_FAILURE_REDIRECT'] || '/';
+}
 
 // The app calls this (authenticated) to get the URL to open —
 // in Capacitor, open it with the in-app Browser plugin so the
@@ -10,7 +31,7 @@ export const dropboxAuthRouter = Router();
 // the system browser.
 dropboxAuthRouter.get('/auth/dropbox/start', requireAuth, async (req, res) => {
   try {
-    const url = await buildAuthUrl(req.userId);
+    const url = await buildAuthUrl(req.userId, currentSite(req));
     res.json({ url });
   } catch (err) {
     console.error('dropbox start error', err);
@@ -26,16 +47,16 @@ dropboxAuthRouter.get('/auth/dropbox/callback', async (req, res) => {
   const { code, state, error: dropboxError } = req.query;
 
   if (dropboxError) {
-    return res.redirect(process.env.DROPBOX_FAILURE_REDIRECT);
+    return res.redirect(backToApp('failed', returnToFromState(state)));
   }
 
   try {
     const userId = verifyState(state);
     await completeAuth(code, userId);
-    res.redirect(process.env.DROPBOX_SUCCESS_REDIRECT);
+    res.redirect(backToApp('connected', returnToFromState(state)));
   } catch (err) {
     console.error('dropbox callback error', err);
-    res.redirect(process.env.DROPBOX_FAILURE_REDIRECT);
+    res.redirect(backToApp('failed', returnToFromState(state)));
   }
 });
 

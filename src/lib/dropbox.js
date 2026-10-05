@@ -10,8 +10,8 @@ import { supabaseAdmin } from './supabaseAdmin.js';
 // the state param carries the user id itself, HMAC-signed so it
 // can't be forged, with a short expiry baked in.
 
-function signState(userId) {
-  const payload = JSON.stringify({ uid: userId, exp: Date.now() + 10 * 60 * 1000 });
+function signState(userId, returnTo) {
+  const payload = JSON.stringify({ uid: userId, ret: returnTo || null, exp: Date.now() + 10 * 60 * 1000 });
   const payloadB64 = Buffer.from(payload).toString('base64url');
   const sig = crypto
     .createHmac('sha256', process.env.TOKEN_ENCRYPTION_KEY)
@@ -33,13 +33,27 @@ export function verifyState(state) {
   return payload.uid;
 }
 
+// Reads the signed state without requiring it to be fresh, only to learn
+// which site the user started from (so we can send them back even on failure).
+// The value is only trusted if the signature is valid.
+export function returnToFromState(state) {
+  try {
+    const [payloadB64, sig] = String(state).split('.');
+    const expectedSig = crypto.createHmac('sha256', process.env.TOKEN_ENCRYPTION_KEY).update(payloadB64).digest('base64url');
+    if (!payloadB64 || sig !== expectedSig) return null;
+    return JSON.parse(Buffer.from(payloadB64, 'base64url').toString()).ret || null;
+  } catch {
+    return null;
+  }
+}
+
 // ---------- Step 1: build the "Connect Dropbox" URL ----------
-export async function buildAuthUrl(userId) {
+export async function buildAuthUrl(userId, returnTo) {
   const dbxAuth = new DropboxAuth({
     clientId: process.env.DROPBOX_APP_KEY,
     clientSecret: process.env.DROPBOX_APP_SECRET,
   });
-  const state = signState(userId);
+  const state = signState(userId, returnTo);
   const url = await dbxAuth.getAuthenticationUrl(
     process.env.DROPBOX_REDIRECT_URI,
     state,
