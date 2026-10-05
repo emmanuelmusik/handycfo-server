@@ -4,6 +4,7 @@ import { supabaseAdmin } from '../lib/supabaseAdmin.js';
 import { getOwnedContact, getOwnedInvoice, route, httpError } from '../lib/ownership.js';
 import { enforceLimit } from '../lib/rateLimit.js';
 import { sendInvoiceEmail } from '../lib/email.js';
+import { renderInvoicePdf, invoiceNumber } from '../lib/invoicePdf.js';
 
 export const networkRouter = Router();
 networkRouter.use(requireAuth);
@@ -143,9 +144,10 @@ networkRouter.post('/invoices/:id/send', route(async (req, res) => {
     try {
       enforceLimit(`invoice-mail:${req.userId}`, 40, 60 * 60 * 1000);
       const { data: me } = await supabaseAdmin.auth.admin.getUserById(req.userId);
+      const pdf = await renderInvoicePdf({ invoice: inv, business: inv.businesses });
       await sendInvoiceEmail({
         invoice: inv, businessName: inv.businesses.name,
-        recipientEmail, replyTo: me?.user?.email,
+        recipientEmail, replyTo: me?.user?.email, pdf,
       });
       await supabaseAdmin.from('invoices').update({ sent_at: new Date().toISOString() }).eq('id', inv.id);
       emailed = true;
@@ -187,4 +189,13 @@ networkRouter.post('/invoices/:id/send', route(async (req, res) => {
     }
   }
   res.json({ sent: true, deliveredInApp, emailed, emailError, emailedTo: emailed ? recipientEmail : null });
+}));
+
+// Download the invoice as a PDF (also what gets attached to the email).
+networkRouter.get('/invoices/:id/pdf', route(async (req, res) => {
+  const inv = await getOwnedInvoice(req.userId, req.params.id);
+  const pdf = await renderInvoicePdf({ invoice: inv, business: inv.businesses });
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="Invoice-${invoiceNumber(inv)}.pdf"`);
+  res.send(pdf);
 }));

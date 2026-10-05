@@ -53,16 +53,17 @@ export async function sendReminderEmail(invoice, recipientEmail) {
 
 // The first email: the invoice itself. Replies go to the freelancer,
 // not to our sending address.
-export async function sendInvoiceEmail({ invoice, businessName, recipientEmail, replyTo }) {
+export async function sendInvoiceEmail({ invoice, businessName, recipientEmail, replyTo, pdf }) {
   const number = invoice.id.slice(0, 8).toUpperCase();
   const { data, error } = await getResend().emails.send({
     from: process.env.REMINDERS_FROM_EMAIL,
     to: recipientEmail,
     replyTo: replyTo || undefined,
+    attachments: pdf ? [{ filename: `Invoice-${number}.pdf`, content: pdf }] : undefined,
     subject: `Invoice ${number} from ${businessName}`,
     html: `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;color:#1c2420">
       <p>Hello ${esc(invoice.client_name)},</p>
-      <p>${esc(businessName)} has sent you an invoice.</p>
+      <p>${esc(businessName)} has sent you an invoice. It is attached to this email as a PDF.</p>
       <table style="border-collapse:collapse;width:100%;margin:18px 0">
         <tr><td style="padding:8px 0;color:#667">Invoice</td><td style="padding:8px 0;text-align:right"><strong>${esc(number)}</strong></td></tr>
         <tr><td style="padding:8px 0;color:#667">Issued</td><td style="padding:8px 0;text-align:right">${esc(invoice.issue_date)}</td></tr>

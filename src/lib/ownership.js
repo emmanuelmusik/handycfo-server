@@ -65,7 +65,7 @@ export async function getOwnedExpense(userId, expenseId) {
 export async function getOwnedInvoice(userId, invoiceId) {
   const { data, error } = await supabaseAdmin
     .from('invoices')
-    .select('*, businesses!inner(owner_id, name)')
+    .select('*, businesses!inner(owner_id, name, vat_number)')
     .eq('id', invoiceId)
     .eq('businesses.owner_id', userId)
     .maybeSingle();
