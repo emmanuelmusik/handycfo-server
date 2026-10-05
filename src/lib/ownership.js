@@ -6,9 +6,10 @@ import { supabaseAdmin } from './supabaseAdmin.js';
 // can forget it. They throw an error with a `status` the route handler
 // turns into the HTTP response.
 
-function httpError(status, message) {
+function httpError(status, message, extra) {
   const err = new Error(message);
   err.status = status;
+  if (extra) err.extra = extra;
   return err;
 }
 
@@ -83,7 +84,7 @@ export function route(handler) {
     } catch (err) {
       const status = err.status || 500;
       if (status >= 500) console.error(`${req.method} ${req.path} failed:`, err);
-      res.status(status).json({ error: status >= 500 && !err.status ? 'Something went wrong' : err.message });
+      res.status(status).json({ error: status >= 500 && !err.status ? 'Something went wrong' : err.message, ...(err.extra || {}) });
     }
   };
 }

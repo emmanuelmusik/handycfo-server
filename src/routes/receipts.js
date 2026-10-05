@@ -5,6 +5,7 @@ import { getOwnedBusiness, getOwnedInboxDoc, getOwnedExpense, route, httpError }
 import { parseReceipts } from '../lib/receiptParser.js';
 import { saveReceipt, getReceiptUrl, removeReceipt, isFileInUse } from '../lib/storage.js';
 import { enforceLimit } from '../lib/rateLimit.js';
+import { findDuplicate, sameReceipt, describeDuplicate } from '../lib/duplicates.js';
 
 export const receiptsRouter = Router();
 receiptsRouter.use(requireAuth);
@@ -56,6 +57,21 @@ receiptsRouter.post('/receipts/scan', route(async (req, res) => {
 
   const stored = await saveReceipt({ userId: req.userId, business, fileName, buffer, mediaType });
 
+  // Flag receipts we already have: in the books, waiting in the inbox, or
+  // repeated inside this very file (e.g. two overlapping photos of one receipt).
+  const dupNotes = [];
+  for (let i = 0; i < parsed.length; i += 1) {
+    const p = parsed[i];
+    const cand = { merchant: p.merchant, date: p.date, amount: p.amount, currency: p.currency };
+    const earlier = parsed.slice(0, i).findIndex((q) => sameReceipt(cand, { merchant: q.merchant, date: q.date, amount: q.amount, currency: q.currency }));
+    if (earlier >= 0) {
+      dupNotes.push(`Possible duplicate of receipt ${earlier + 1} in this same file.`);
+      continue;
+    }
+    const found = await findDuplicate(business.id, cand).catch(() => null);
+    dupNotes.push(found ? describeDuplicate(found) : '');
+  }
+
   const total = parsed.length;
   const baseName = String(fileName || 'receipt').slice(0, 100);
   const rows = parsed.map((p, i) => {
@@ -74,7 +90,7 @@ receiptsRouter.post('/receipts/scan', route(async (req, res) => {
       extracted_category: p.category,
       extracted_currency: p.currencySupported ? p.currency : business.currency,
       extracted_confidence: p.confidence,
-      extracted_notes: [where, p.notes, currencyNote].filter(Boolean).join(' ') || null,
+      extracted_notes: [dupNotes[i], where, p.notes, currencyNote].filter(Boolean).join(' ') || null,
       receipt_provider: stored.provider,
       receipt_external_id: stored.externalId,
     };
@@ -113,6 +129,11 @@ receiptsRouter.post('/inbox/:id/confirm', route(async (req, res) => {
   if (!Number.isFinite(amount) || amount < 0) throw httpError(400, 'Enter a valid amount.');
   if (!Number.isFinite(vat) || vat < 0 || vat > amount) throw httpError(400, 'VAT cannot be higher than the total.');
   if (!date) throw httpError(400, 'Enter a valid date.');
+
+  if (!b.allowDuplicate) {
+    const dup = await findDuplicate(doc.business_id, { merchant, date, amount, currency }, { exceptInboxId: doc.id, includeInbox: false });
+    if (dup) throw httpError(409, describeDuplicate(dup), { code: 'duplicate', duplicate: dup });
+  }
 
   const { data: expense, error } = await supabaseAdmin
     .from('expenses')
