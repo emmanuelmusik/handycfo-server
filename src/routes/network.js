@@ -1,10 +1,15 @@
 import { Router } from 'express';
 import { requireAuth } from '../lib/auth.js';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
-import { getOwnedContact, getOwnedInvoice, route, httpError } from '../lib/ownership.js';
+import { getOwnedContact, getOwnedInvoice, getOwnedBusiness, route, httpError } from '../lib/ownership.js';
 import { enforceLimit } from '../lib/rateLimit.js';
 import { sendInvoiceEmail } from '../lib/email.js';
 import { renderInvoicePdf, invoiceNumber } from '../lib/invoicePdf.js';
+import { COUNTRIES } from '../lib/countries.js';
+import { LANGS } from '../lib/invoiceI18n.js';
+import { computeInvoice } from '../lib/invoiceMath.js';
+import { sellerSnapshot, chooseMode, checkInvoice } from '../lib/invoiceRules.js';
+import { loadItems, toCalcItems, sellerFor, allocateInvoiceNumber } from '../lib/invoiceService.js';
 
 export const networkRouter = Router();
 networkRouter.use(requireAuth);
@@ -49,6 +54,23 @@ async function reciprocalContact(me, linkedUserId, myRelationship) {
   return data;
 }
 
+const COUNTRY_CODES = new Set(COUNTRIES.map(([c]) => c));
+const clip = (v, max) => { const t = String(v ?? '').trim().slice(0, max); return t || null; };
+
+// Address, tax id and invoice language of a customer or supplier.
+function contactDetails(body) {
+  const b = body || {};
+  return {
+    street: clip(b.street, 120),
+    postal_code: clip(b.postalCode, 20),
+    city: clip(b.city, 80),
+    region: clip(b.region, 60),
+    country: COUNTRY_CODES.has(b.country) ? b.country : null,
+    tax_id: clip(b.taxId, 40),
+    language: LANGS.includes(b.language) ? b.language : null,
+  };
+}
+
 networkRouter.post('/contacts', route(async (req, res) => {
   const name = String(req.body?.name || '').trim().slice(0, 100);
   const relationship = req.body?.relationship === 'Client' ? 'Client' : 'Supplier';
@@ -63,11 +85,30 @@ networkRouter.post('/contacts', route(async (req, res) => {
   const { data, error } = await supabaseAdmin
     .from('contacts')
     .insert({
-      owner_id: req.userId, name, relationship, email,
+      owner_id: req.userId, name, relationship, email, ...contactDetails(req.body),
       on_platform: !!linkedUserId, linked_user_id: linkedUserId,
       color: COLORS[Math.floor(Math.random() * COLORS.length)],
     })
     .select('*').single();
+  if (error) throw new Error(error.message);
+  res.json({ contact: data });
+}));
+
+// Change a contact's name, email, address and tax details.
+networkRouter.put('/contacts/:id', route(async (req, res) => {
+  const c = await getOwnedContact(req.userId, req.params.id);
+  const name = String(req.body?.name || '').trim().slice(0, 100);
+  const email = String(req.body?.email || '').trim().toLowerCase() || null;
+  if (!name) throw httpError(400, 'Name is required.');
+  if (email && !EMAIL_RE.test(email)) throw httpError(400, 'That email address does not look right.');
+  const patch = { name, email, ...contactDetails(req.body) };
+  if (email !== c.email) {
+    const uid = await findUserIdByEmail(email);
+    if (uid === req.userId) throw httpError(400, 'That is your own email address.');
+    patch.linked_user_id = uid;
+    patch.on_platform = !!uid;
+  }
+  const { data, error } = await supabaseAdmin.from('contacts').update(patch).eq('id', c.id).select('*').single();
   if (error) throw new Error(error.message);
   res.json({ contact: data });
 }));
@@ -123,8 +164,10 @@ networkRouter.post('/messages', route(async (req, res) => {
 // Send an invoice. Marks it Sent; if the client uses HandyCFO it
 // also lands in their Financial Inbox, ready to review and record.
 networkRouter.post('/invoices/:id/send', route(async (req, res) => {
-  const inv = await getOwnedInvoice(req.userId, req.params.id);
+  let inv = await getOwnedInvoice(req.userId, req.params.id);
   if (inv.status === 'Paid') throw httpError(409, 'This invoice is already paid.');
+  const business = await getOwnedBusiness(req.userId, inv.business_id);
+  const itemRows = await loadItems(inv.id);
 
   // The sender chooses where it goes. With no choice given, use both (as before).
   const channels = req.body?.channels;
@@ -132,8 +175,27 @@ networkRouter.post('/invoices/:id/send', route(async (req, res) => {
   const wantApp = Array.isArray(channels) ? channels.includes('app') : true;
 
   if (inv.status === 'Draft') {
-    await supabaseAdmin.from('invoices').update({ status: 'Sent' }).eq('id', inv.id);
+    // First send: make sure it is complete, give it its number, and freeze the seller details.
+    const seller = sellerSnapshot(business);
+    const taxEnabled = business.tax_mode === 'vat' || business.tax_mode === 'sales_tax';
+    const calc = computeInvoice(toCalcItems(itemRows), { includeTax: inv.prices_include_tax, taxEnabled });
+    const mode = chooseMode({ seller, grossCents: calc.grossCents, currency: inv.currency, clientCountry: inv.client_country, requested: inv.invoice_mode === 'full' ? 'full' : 'auto' });
+    const { missing, warnings } = checkInvoice({ seller, invoice: inv, items: toCalcItems(itemRows), mode, grossCents: calc.grossCents });
+    if (missing.length) {
+      throw httpError(422, 'This invoice is not ready to send yet.', { code: 'missing', missing, warnings });
+    }
+    const number = inv.invoice_number || await allocateInvoiceNumber(business, inv.issue_date);
+    const { data: updated, error: upErr } = await supabaseAdmin
+      .from('invoices')
+      .update({
+        status: 'Sent', invoice_number: number, payment_reference: inv.payment_reference || number,
+        seller_snapshot: seller, tax_mode: business.tax_mode, invoice_mode: mode,
+      })
+      .eq('id', inv.id).select('*').single();
+    if (upErr) throw new Error(upErr.message);
+    inv = { ...inv, ...updated };
   }
+  const seller = sellerFor(inv, business);
 
   // Email the invoice to the saved address, once.
   let emailed = false;
@@ -151,10 +213,10 @@ networkRouter.post('/invoices/:id/send', route(async (req, res) => {
     try {
       enforceLimit(`invoice-mail:${req.userId}`, 40, 60 * 60 * 1000);
       const { data: me } = await supabaseAdmin.auth.admin.getUserById(req.userId);
-      const pdf = await renderInvoicePdf({ invoice: inv, business: inv.businesses });
+      const pdf = await renderInvoicePdf({ invoice: inv, items: toCalcItems(itemRows), seller });
       await sendInvoiceEmail({
-        invoice: inv, businessName: inv.businesses.name,
-        recipientEmail, replyTo: me?.user?.email, pdf,
+        invoice: inv, businessName: seller.legal_name || seller.name,
+        recipientEmail, replyTo: seller.contact_email || me?.user?.email, pdf,
       });
       await supabaseAdmin.from('invoices').update({ sent_at: new Date().toISOString() }).eq('id', inv.id);
       emailed = true;
@@ -177,16 +239,16 @@ networkRouter.post('/invoices/:id/send', route(async (req, res) => {
           business_id: theirBiz.id,
           source: 'supplier',
           contact_id: theirContact.id,
-          file_name: `Invoice from ${inv.businesses.name}`,
+          file_name: `Invoice ${invoiceNumber(inv)} from ${business.name}`,
           state: 'ready',
-          extracted_merchant: inv.businesses.name,
+          extracted_merchant: seller.legal_name || business.name,
           extracted_date: inv.issue_date,
           extracted_amount: inv.amount,
-          extracted_vat: null,
+          extracted_vat: Number(inv.vat_amount) > 0 ? inv.vat_amount : null,
           extracted_category: 'Other',
           extracted_currency: inv.currency,
           extracted_confidence: 'high',
-          extracted_notes: `Sent to you on HandyCFO. Due ${inv.due_date}.`,
+          extracted_notes: `Sent to you on HandyCFO. Invoice ${invoiceNumber(inv)}, due ${inv.due_date}.`,
           source_invoice_id: inv.id,
         });
         // Already delivered earlier (unique index) is fine.
@@ -203,9 +265,17 @@ networkRouter.post('/invoices/:id/send', route(async (req, res) => {
 
 // Download the invoice as a PDF (also what gets attached to the email).
 networkRouter.get('/invoices/:id/pdf', route(async (req, res) => {
-  const inv = await getOwnedInvoice(req.userId, req.params.id);
-  const pdf = await renderInvoicePdf({ invoice: inv, business: inv.businesses });
+  let inv = await getOwnedInvoice(req.userId, req.params.id);
+  const business = await getOwnedBusiness(req.userId, inv.business_id);
+  // A paid invoice that was never sent still needs a proper number.
+  if (inv.status !== 'Draft' && !inv.invoice_number) {
+    const number = await allocateInvoiceNumber(business, inv.issue_date);
+    const { data } = await supabaseAdmin.from('invoices').update({ invoice_number: number, payment_reference: inv.payment_reference || number }).eq('id', inv.id).select('*').single();
+    inv = { ...inv, ...data };
+  }
+  const items = toCalcItems(await loadItems(inv.id));
+  const pdf = await renderInvoicePdf({ invoice: inv, items, seller: sellerFor(inv, business) });
   res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename="Invoice-${invoiceNumber(inv)}.pdf"`);
+  res.setHeader('Content-Disposition', `attachment; filename="Invoice-${inv.invoice_number || 'draft'}.pdf"`);
   res.send(pdf);
 }));

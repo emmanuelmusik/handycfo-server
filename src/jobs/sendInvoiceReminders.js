@@ -23,7 +23,7 @@ export async function runReminderJob() {
 
   const { data: invoices, error } = await supabaseAdmin
     .from('invoices')
-    .select('id, business_id, client_contact_id, client_name, client_email, due_date, amount, currency, status, reminder_level, auto_reminders')
+    .select('id, invoice_number, business_id, client_contact_id, client_name, client_email, due_date, amount, currency, status, reminder_level, auto_reminders')
     .in('status', ['Sent', 'Overdue']);
 
   if (error) {

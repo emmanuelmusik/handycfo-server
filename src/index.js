@@ -6,6 +6,7 @@ import { dropboxAuthRouter } from './routes/dropboxAuth.js';
 import { receiptsRouter } from './routes/receipts.js';
 import { networkRouter } from './routes/network.js';
 import { accountRouter } from './routes/account.js';
+import { invoicesRouter } from './routes/invoices.js';
 import { runReminderJob } from './jobs/sendInvoiceReminders.js';
 
 const app = express();
@@ -21,6 +22,7 @@ app.get('/healthz', (req, res) => res.json({ ok: true }));
 app.use(dropboxAuthRouter);
 app.use(receiptsRouter);
 app.use(networkRouter);
+app.use(invoicesRouter);
 app.use(accountRouter);
 
 // Manual trigger for testing/observability — e.g. an uptime pinger,
