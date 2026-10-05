@@ -6,6 +6,7 @@ import Anthropic from '@anthropic-ai/sdk';
 
 export const CATEGORIES = ['Software', 'Travel', 'Office', 'Meals', 'Marketing', 'Materials', 'Shipping', 'Other'];
 const SUPPORTED_CURRENCIES = ['EUR', 'USD', 'GBP'];
+export const MAX_RECEIPTS = 12;
 
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5-5';
 
@@ -20,35 +21,44 @@ function getClient() {
   return client;
 }
 
+const RECEIPT_PROPS = {
+  merchant: { type: 'string', description: 'The business that issued the receipt, as printed.' },
+  date: { type: ['string', 'null'], description: 'Receipt date as YYYY-MM-DD, or null if not visible.' },
+  total_amount: { type: ['number', 'null'], description: 'Total paid or payable including VAT/tax, or null if not visible.' },
+  vat_amount: { type: ['number', 'null'], description: 'The VAT/tax portion included in the total, or null if not shown.' },
+  currency: { type: 'string', description: 'ISO 4217 code such as EUR, USD or GBP. Use EUR if unclear and it looks European.' },
+  category: { type: 'string', enum: CATEGORIES },
+  confidence: { type: 'string', enum: ['high', 'medium', 'low'], description: 'How sure you are about the amounts and merchant.' },
+  notes: { type: 'string', description: 'One short sentence on anything uncertain (blurry total, cut off, etc). Empty if nothing.' },
+  page: { type: ['integer', 'null'], description: 'Page or image number (starting at 1) this receipt appears on.' },
+};
+
 const TOOL = {
-  name: 'record_receipt',
-  description: 'Record the details read from a receipt or supplier invoice.',
+  name: 'record_receipts',
+  description: 'Record every receipt or supplier invoice found in the document. Use an empty list if there are none.',
   input_schema: {
     type: 'object',
     properties: {
-      is_receipt: {
-        type: 'boolean',
-        description: 'False if the image is not a receipt, invoice or bill at all.',
+      receipts: {
+        type: 'array',
+        items: { type: 'object', properties: RECEIPT_PROPS, required: Object.keys(RECEIPT_PROPS) },
       },
-      merchant: { type: 'string', description: 'The business that issued the document, as printed.' },
-      date: { type: ['string', 'null'], description: 'Document date as YYYY-MM-DD, or null if not visible.' },
-      total_amount: { type: ['number', 'null'], description: 'Total paid or payable including VAT/tax, or null if not visible.' },
-      vat_amount: { type: ['number', 'null'], description: 'The VAT/tax portion included in the total, or null if not shown.' },
-      currency: { type: 'string', description: 'ISO 4217 code such as EUR, USD or GBP. Use EUR if unclear and the document looks European.' },
-      category: { type: 'string', enum: CATEGORIES },
-      confidence: { type: 'string', enum: ['high', 'medium', 'low'], description: 'How sure you are about the amounts and merchant.' },
-      notes: { type: 'string', description: 'One short sentence on anything uncertain (blurry total, multiple totals, etc). Empty if nothing.' },
     },
-    required: ['is_receipt', 'merchant', 'date', 'total_amount', 'vat_amount', 'currency', 'category', 'confidence', 'notes'],
+    required: ['receipts'],
   },
 };
 
-const PROMPT = `Read this document and call record_receipt.
+const PROMPT = `Read this document and report every separate receipt, bill or invoice in it.
+- It may hold ONE receipt (the usual case) or SEVERAL: for example a photo of a few receipts laid out together, or a PDF with a receipt on each page. Return one entry per separate receipt. Never merge two receipts into one, and never split one receipt into several.
+- If it is not a receipt at all, return an empty list.
+- List them in reading order: page by page, top to bottom, left to right.
+- A receipt that is partly cut off or blurry is still included, with confidence "low" and a note.
 - total_amount is the final amount paid or due, including tax.
 - vat_amount is only the tax part, and only if the document shows it. Do not calculate it yourself.
 - Dates are often day/month/year in Europe. Output YYYY-MM-DD.
 - Never guess a number you cannot read. Use null and say so in notes.
-- Pick the closest category; use Other if none fits.`;
+- Pick the closest category; use Other if none fits.
+- At most ${MAX_RECEIPTS} receipts.`;
 
 function toContentBlock(buffer, mediaType) {
   const data = buffer.toString('base64');
@@ -58,16 +68,12 @@ function toContentBlock(buffer, mediaType) {
   return { type: 'image', source: { type: 'base64', media_type: mediaType, data } };
 }
 
-async function callGrok(buffer, mediaType) {
+async function callGrok(images) {
   const key = process.env.XAI_API_KEY;
   const model = process.env.XAI_MODEL || 'grok-4';
-  if (mediaType === 'application/pdf') {
-    const err = new Error('Grok reads photos, not PDFs. Please update the app so PDFs are converted first.');
-    err.status = 400;
-    throw err;
-  }
-  const schemaHint = `Reply with ONLY a JSON object with exactly these keys:
-{"is_receipt": boolean, "merchant": string, "date": "YYYY-MM-DD" or null, "total_amount": number or null, "vat_amount": number or null, "currency": "EUR"|"USD"|"GBP"|other ISO code, "category": one of ${CATEGORIES.join(', ')}, "confidence": "high"|"medium"|"low", "notes": string}`;
+  const schemaHint = `Reply with ONLY a JSON object of this shape:
+{"receipts": [{"merchant": string, "date": "YYYY-MM-DD" or null, "total_amount": number or null, "vat_amount": number or null, "currency": "EUR"|"USD"|"GBP"|other ISO code, "category": one of ${CATEGORIES.join(', ')}, "confidence": "high"|"medium"|"low", "notes": string, "page": integer or null}]}
+Use {"receipts": []} if there is no receipt.`;
   const res = await fetch('https://api.x.ai/v1/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
@@ -77,8 +83,11 @@ async function callGrok(buffer, mediaType) {
       messages: [{
         role: 'user',
         content: [
-          { type: 'image_url', image_url: { url: `data:${mediaType};base64,${buffer.toString('base64')}`, detail: 'high' } },
-          { type: 'text', text: `${PROMPT}\n\n${schemaHint}` },
+          ...images.map((img) => ({
+            type: 'image_url',
+            image_url: { url: `data:${img.mediaType};base64,${img.buffer.toString('base64')}`, detail: 'high' },
+          })),
+          { type: 'text', text: `${PROMPT}\n${images.length > 1 ? `The ${images.length} images above are the pages in order.\n` : ''}\n${schemaHint}` },
         ],
       }],
     }),
@@ -94,36 +103,33 @@ async function callGrok(buffer, mediaType) {
   const content = json.choices?.[0]?.message?.content || '';
   const match = content.match(/\{[\s\S]*\}/);
   if (!match) throw new Error('The scan did not return any details.');
-  return JSON.parse(match[0]);
+  return JSON.parse(match[0]).receipts || [];
 }
 
-async function callClaude(buffer, mediaType) {
+async function callClaude(original, images) {
+  // Claude reads the original PDF directly; for photos use the image.
+  const blocks = original.mediaType === 'application/pdf'
+    ? [toContentBlock(original.buffer, original.mediaType)]
+    : images.map((img) => toContentBlock(img.buffer, img.mediaType));
   const response = await getClient().messages.create({
     model: MODEL,
-    max_tokens: 1024,
+    max_tokens: 4096,
     tools: [TOOL],
-    tool_choice: { type: 'tool', name: 'record_receipt' },
-    messages: [
-      { role: 'user', content: [toContentBlock(buffer, mediaType), { type: 'text', text: PROMPT }] },
-    ],
+    tool_choice: { type: 'tool', name: 'record_receipts' },
+    messages: [{ role: 'user', content: [...blocks, { type: 'text', text: PROMPT }] }],
   });
-
   const block = response.content.find((b) => b.type === 'tool_use');
   if (!block) throw new Error('The scan did not return any details.');
-  return block.input;
+  return block.input.receipts || [];
 }
 
-export async function parseReceipt(buffer, mediaType) {
-  const r = process.env.XAI_API_KEY ? await callGrok(buffer, mediaType) : await callClaude(buffer, mediaType);
-
+function normalize(r) {
   const currency = String(r.currency || 'EUR').toUpperCase();
   const amount = typeof r.total_amount === 'number' && r.total_amount >= 0 ? r.total_amount : null;
   let vat = typeof r.vat_amount === 'number' && r.vat_amount >= 0 ? r.vat_amount : null;
   if (vat !== null && amount !== null && vat > amount) vat = null; // nonsense, drop it
   const date = /^\d{4}-\d{2}-\d{2}$/.test(r.date || '') ? r.date : null;
-
   return {
-    isReceipt: r.is_receipt !== false,
     merchant: String(r.merchant || '').trim().slice(0, 120),
     date,
     amount,
@@ -133,5 +139,14 @@ export async function parseReceipt(buffer, mediaType) {
     category: CATEGORIES.includes(r.category) ? r.category : 'Other',
     confidence: ['high', 'medium', 'low'].includes(r.confidence) ? r.confidence : 'low',
     notes: String(r.notes || '').slice(0, 300),
+    page: Number.isInteger(r.page) && r.page > 0 ? r.page : null,
   };
+}
+
+// original: { buffer, mediaType } is exactly what the user uploaded.
+// images: what a reader that only takes pictures should look at (the photo
+// itself, or one picture per PDF page). Returns a list: one entry per receipt.
+export async function parseReceipts(original, images) {
+  const raw = process.env.XAI_API_KEY ? await callGrok(images) : await callClaude(original, images);
+  return raw.slice(0, MAX_RECEIPTS).map(normalize);
 }

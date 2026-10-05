@@ -93,3 +93,16 @@ export function mimeFromName(fileName, fallback = 'application/octet-stream') {
     jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', pdf: 'application/pdf',
   })[ext] || fallback;
 }
+
+// One photo or PDF can hold several receipts, so several inbox items and
+// expenses may point at the same stored file. It may only be deleted when
+// nothing else still uses it.
+export async function isFileInUse(externalId, { exceptInboxId = null, exceptExpenseId = null } = {}) {
+  if (!externalId) return false;
+  let inbox = supabaseAdmin.from('inbox_documents').select('id', { count: 'exact', head: true }).eq('receipt_external_id', externalId);
+  if (exceptInboxId) inbox = inbox.neq('id', exceptInboxId);
+  let expenses = supabaseAdmin.from('expenses').select('id', { count: 'exact', head: true }).eq('receipt_external_id', externalId);
+  if (exceptExpenseId) expenses = expenses.neq('id', exceptExpenseId);
+  const [a, b] = await Promise.all([inbox, expenses]);
+  return (a.count || 0) + (b.count || 0) > 0;
+}

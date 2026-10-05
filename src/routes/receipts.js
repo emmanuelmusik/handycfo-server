@@ -2,8 +2,8 @@ import { Router } from 'express';
 import { requireAuth } from '../lib/auth.js';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
 import { getOwnedBusiness, getOwnedInboxDoc, getOwnedExpense, route, httpError } from '../lib/ownership.js';
-import { parseReceipt } from '../lib/receiptParser.js';
-import { saveReceipt, getReceiptUrl, removeReceipt } from '../lib/storage.js';
+import { parseReceipts } from '../lib/receiptParser.js';
+import { saveReceipt, getReceiptUrl, removeReceipt, isFileInUse } from '../lib/storage.js';
 import { enforceLimit } from '../lib/rateLimit.js';
 
 export const receiptsRouter = Router();
@@ -11,10 +11,12 @@ receiptsRouter.use(requireAuth);
 
 const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf'];
 const MAX_BYTES = 8 * 1024 * 1024;
+const MAX_PAGES = 8;
 
-// Scan a receipt: read it with AI, store the file, create an inbox row.
+// Scan a file: read every receipt in it, store the file once, and create
+// one inbox item per receipt. A photo or PDF may hold one receipt or several.
 receiptsRouter.post('/receipts/scan', route(async (req, res) => {
-  const { businessId, fileName, mediaType, data, readData, readMediaType } = req.body || {};
+  const { businessId, fileName, mediaType, data, readImages } = req.body || {};
   const business = await getOwnedBusiness(req.userId, businessId);
 
   if (!ALLOWED_TYPES.includes(mediaType)) throw httpError(400, 'Please upload a photo (JPG, PNG, WebP) or a PDF.');
@@ -22,52 +24,68 @@ receiptsRouter.post('/receipts/scan', route(async (req, res) => {
   const buffer = Buffer.from(data, 'base64');
   if (buffer.length === 0 || buffer.length > MAX_BYTES) throw httpError(413, 'That file is too large. Please keep it under 8 MB.');
 
+  // Pictures for readers that cannot take PDFs: one per page.
+  let images;
+  if (mediaType === 'application/pdf') {
+    if (!Array.isArray(readImages) || readImages.length === 0) {
+      throw httpError(400, 'Please update the app so PDFs can be read.');
+    }
+    images = readImages.slice(0, MAX_PAGES).map((img) => {
+      if (!['image/jpeg', 'image/png', 'image/webp'].includes(img?.mediaType) || typeof img?.data !== 'string') {
+        throw httpError(400, 'A page image sent with the PDF is not valid.');
+      }
+      const buf = Buffer.from(img.data, 'base64');
+      if (buf.length === 0 || buf.length > 4 * 1024 * 1024) throw httpError(413, 'A PDF page is too large to read.');
+      return { buffer: buf, mediaType: img.mediaType };
+    });
+  } else {
+    images = [{ buffer, mediaType }];
+  }
+
   enforceLimit(`scan:${req.userId}`, 30, 60 * 60 * 1000);
 
   let parsed;
   try {
-    // PDFs may come with a rendered page image for readers that cannot take PDFs.
-    const readBuffer = readData ? Buffer.from(readData, 'base64') : buffer;
-    const readType = readData ? readMediaType : mediaType;
-    if (readData && (!ALLOWED_TYPES.includes(readType) || readBuffer.length > MAX_BYTES)) {
-      throw httpError(400, 'The page image sent with the PDF is not valid.');
-    }
-    parsed = await parseReceipt(readBuffer, readType);
+    parsed = await parseReceipts({ buffer, mediaType }, images);
   } catch (err) {
     if (err.status) throw err;
     console.error('receipt parse failed:', err);
     throw httpError(502, 'We could not read that document. Please try a clearer photo.');
   }
-  if (!parsed.isReceipt) throw httpError(422, 'That does not look like a receipt or invoice.');
+  if (parsed.length === 0) throw httpError(422, 'That does not look like a receipt or invoice.');
 
   const stored = await saveReceipt({ userId: req.userId, business, fileName, buffer, mediaType });
 
-  const { data: doc, error } = await supabaseAdmin
-    .from('inbox_documents')
-    .insert({
+  const total = parsed.length;
+  const baseName = String(fileName || 'receipt').slice(0, 100);
+  const rows = parsed.map((p, i) => {
+    const where = [total > 1 ? `Receipt ${i + 1} of ${total} in this file.` : '', p.page && (mediaType === 'application/pdf' || images.length > 1) ? `Page ${p.page}.` : '']
+      .filter(Boolean).join(' ');
+    const currencyNote = p.currencySupported ? '' : `Document currency was ${p.currency}; please check the amount.`;
+    return {
       business_id: business.id,
       source: 'upload',
-      file_name: String(fileName || 'receipt').slice(0, 120),
+      file_name: total > 1 ? `${baseName} (${i + 1}/${total})` : baseName,
       state: 'ready',
-      extracted_merchant: parsed.merchant || null,
-      extracted_date: parsed.date,
-      extracted_amount: parsed.amount,
-      extracted_vat: parsed.vat,
-      extracted_category: parsed.category,
-      extracted_currency: parsed.currencySupported ? parsed.currency : business.currency,
-      extracted_confidence: parsed.confidence,
-      extracted_notes: parsed.currencySupported ? parsed.notes : `${parsed.notes} Document currency was ${parsed.currency}; please check the amount.`.trim(),
+      extracted_merchant: p.merchant || null,
+      extracted_date: p.date,
+      extracted_amount: p.amount,
+      extracted_vat: p.vat,
+      extracted_category: p.category,
+      extracted_currency: p.currencySupported ? p.currency : business.currency,
+      extracted_confidence: p.confidence,
+      extracted_notes: [where, p.notes, currencyNote].filter(Boolean).join(' ') || null,
       receipt_provider: stored.provider,
       receipt_external_id: stored.externalId,
-    })
-    .select('*')
-    .single();
+    };
+  });
 
+  const { data: docs, error } = await supabaseAdmin.from('inbox_documents').insert(rows).select('*');
   if (error) {
     await removeReceipt(req.userId, stored.provider, stored.externalId, { allowDropboxDelete: true });
     throw new Error(`Could not save the scan: ${error.message}`);
   }
-  res.json({ document: doc });
+  res.json({ documents: docs, document: docs[0] });
 }));
 
 // Short-lived link to view the original file of an inbox item.
@@ -121,7 +139,7 @@ receiptsRouter.post('/inbox/:id/confirm', route(async (req, res) => {
 // for supplier invoices there is no file.
 receiptsRouter.delete('/inbox/:id', route(async (req, res) => {
   const doc = await getOwnedInboxDoc(req.userId, req.params.id);
-  if (doc.state !== 'reviewed') {
+  if (doc.state !== 'reviewed' && !(await isFileInUse(doc.receipt_external_id, { exceptInboxId: doc.id }))) {
     await removeReceipt(req.userId, doc.receipt_provider, doc.receipt_external_id, { allowDropboxDelete: true });
   }
   await supabaseAdmin.from('inbox_documents').delete().eq('id', doc.id);
@@ -141,7 +159,7 @@ receiptsRouter.get('/expenses/:id/receipt', route(async (req, res) => {
 receiptsRouter.delete('/expenses/:id', route(async (req, res) => {
   const exp = await getOwnedExpense(req.userId, req.params.id);
   await supabaseAdmin.from('expenses').delete().eq('id', exp.id);
-  if (exp.receipt_provider === 'supabase') {
+  if (exp.receipt_provider === 'supabase' && !(await isFileInUse(exp.receipt_external_id, { exceptExpenseId: exp.id }))) {
     await removeReceipt(req.userId, 'supabase', exp.receipt_external_id);
   }
   res.json({ deleted: true });

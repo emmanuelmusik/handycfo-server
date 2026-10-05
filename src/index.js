@@ -10,7 +10,7 @@ import { runReminderJob } from './jobs/sendInvoiceReminders.js';
 
 const app = express();
 // Receipt uploads arrive as base64 JSON, so that one route gets a larger body limit.
-app.use('/receipts/scan', express.json({ limit: '14mb' }));
+app.use('/receipts/scan', express.json({ limit: '28mb' }));
 app.use(express.json({ limit: '100kb' }));
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
