@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { consume, refund } from '../lib/plans.js';
 import { requireAuth } from '../lib/auth.js';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
 import { getOwnedContact, getOwnedInvoice, getOwnedBusiness, route, httpError } from '../lib/ownership.js';
@@ -184,7 +185,15 @@ networkRouter.post('/invoices/:id/send', route(async (req, res) => {
     if (missing.length) {
       throw httpError(422, 'This invoice is not ready to send yet.', { code: 'missing', missing, warnings });
     }
-    const number = inv.invoice_number || await allocateInvoiceNumber(business, inv.issue_date);
+    // Sending an invoice for the first time uses one of this month's invoices on the Free plan.
+    await consume(req.userId, 'invoices');
+    let number;
+    try {
+      number = inv.invoice_number || await allocateInvoiceNumber(business, inv.issue_date);
+    } catch (err) {
+      await refund(req.userId, 'invoices');
+      throw err;
+    }
     const { data: updated, error: upErr } = await supabaseAdmin
       .from('invoices')
       .update({
@@ -192,7 +201,10 @@ networkRouter.post('/invoices/:id/send', route(async (req, res) => {
         seller_snapshot: seller, tax_mode: business.tax_mode, invoice_mode: mode,
       })
       .eq('id', inv.id).select('*').single();
-    if (upErr) throw new Error(upErr.message);
+    if (upErr) {
+      await refund(req.userId, 'invoices');
+      throw new Error(upErr.message);
+    }
     inv = { ...inv, ...updated };
   }
   const seller = sellerFor(inv, business);

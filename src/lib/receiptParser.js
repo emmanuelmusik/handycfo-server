@@ -68,7 +68,7 @@ function toContentBlock(buffer, mediaType) {
   return { type: 'image', source: { type: 'base64', media_type: mediaType, data } };
 }
 
-async function callGrok(images) {
+async function callGrok(images, onUsage) {
   const key = process.env.XAI_API_KEY;
   const model = process.env.XAI_MODEL || 'grok-4';
   const schemaHint = `Reply with ONLY a JSON object of this shape:
@@ -100,13 +100,14 @@ Use {"receipts": []} if there is no receipt.`;
     throw err;
   }
   const json = await res.json();
+  onUsage?.({ model, usage: json.usage || null });
   const content = json.choices?.[0]?.message?.content || '';
   const match = content.match(/\{[\s\S]*\}/);
   if (!match) throw new Error('The scan did not return any details.');
   return JSON.parse(match[0]).receipts || [];
 }
 
-async function callClaude(original, images) {
+async function callClaude(original, images, onUsage) {
   // Claude reads the original PDF directly; for photos use the image.
   const blocks = original.mediaType === 'application/pdf'
     ? [toContentBlock(original.buffer, original.mediaType)]
@@ -118,6 +119,7 @@ async function callClaude(original, images) {
     tool_choice: { type: 'tool', name: 'record_receipts' },
     messages: [{ role: 'user', content: [...blocks, { type: 'text', text: PROMPT }] }],
   });
+  onUsage?.({ model: MODEL, usage: response.usage || null });
   const block = response.content.find((b) => b.type === 'tool_use');
   if (!block) throw new Error('The scan did not return any details.');
   return block.input.receipts || [];
@@ -146,7 +148,7 @@ function normalize(r) {
 // original: { buffer, mediaType } is exactly what the user uploaded.
 // images: what a reader that only takes pictures should look at (the photo
 // itself, or one picture per PDF page). Returns a list: one entry per receipt.
-export async function parseReceipts(original, images) {
-  const raw = process.env.XAI_API_KEY ? await callGrok(images) : await callClaude(original, images);
+export async function parseReceipts(original, images, onUsage) {
+  const raw = process.env.XAI_API_KEY ? await callGrok(images, onUsage) : await callClaude(original, images, onUsage);
   return raw.slice(0, MAX_RECEIPTS).map(normalize);
 }

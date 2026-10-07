@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
 import { sendReminderEmail } from '../lib/email.js';
+import { plansEnforced, isActivePaid } from '../lib/plans.js';
 
 const LEVEL_RANK = { none: 0, '1st': 1, '2nd': 2, final: 3 };
 
@@ -32,6 +33,19 @@ export async function runReminderJob() {
     return results;
   }
 
+  // Automatic reminders are a paid feature. Work out who is on a paid plan once per run.
+  const enforced = await plansEnforced();
+  const paidOwners = new Set();
+  const ownerOf = new Map();
+  if (enforced) {
+    const [{ data: subs }, { data: biz }] = await Promise.all([
+      supabaseAdmin.from('subscriptions').select('user_id, plan, current_period_end'),
+      supabaseAdmin.from('businesses').select('id, owner_id'),
+    ]);
+    for (const s of subs || []) if (isActivePaid(s)) paidOwners.add(s.user_id);
+    for (const b of biz || []) ownerOf.set(b.id, b.owner_id);
+  }
+
   for (const invoice of invoices) {
     const overdueDays = daysOverdue(invoice.due_date);
 
@@ -53,6 +67,7 @@ export async function runReminderJob() {
     //    the invoice has progressed to a new reminder level since
     //    we last checked — this is what stops it re-sending daily.
     if (!invoice.auto_reminders) continue;
+    if (enforced && !paidOwners.has(ownerOf.get(invoice.business_id))) continue; // Free plan: no automatic reminders
 
     const targetLevel = targetLevelFor(overdueDays);
     if (LEVEL_RANK[targetLevel] <= LEVEL_RANK[invoice.reminder_level]) continue; // no progression, nothing to do

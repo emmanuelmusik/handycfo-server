@@ -5,6 +5,7 @@ import { getOwnedBusiness, getOwnedInboxDoc, getOwnedExpense, route, httpError }
 import { parseReceipts } from '../lib/receiptParser.js';
 import { saveReceipt, getReceiptUrl, removeReceipt, isFileInUse } from '../lib/storage.js';
 import { enforceLimit } from '../lib/rateLimit.js';
+import { consume, refund } from '../lib/plans.js';
 import { findDuplicate, sameReceipt, describeDuplicate } from '../lib/duplicates.js';
 
 export const receiptsRouter = Router();
@@ -45,15 +46,26 @@ receiptsRouter.post('/receipts/scan', route(async (req, res) => {
 
   enforceLimit(`scan:${req.userId}`, 30, 60 * 60 * 1000);
 
+  // One scan is taken from the monthly allowance; it is given back if nothing could be read.
+  await consume(req.userId, 'scans');
   let parsed;
   try {
-    parsed = await parseReceipts({ buffer, mediaType }, images);
+    parsed = await parseReceipts({ buffer, mediaType }, images, ({ model, usage }) => {
+      // Record what this scan cost, so prices and limits can be set from real numbers.
+      supabaseAdmin.from('scan_log').insert({ user_id: req.userId, model, usage }).then(({ error }) => {
+        if (error) console.error('scan_log insert failed:', error.message);
+      });
+    });
   } catch (err) {
+    await refund(req.userId, 'scans');
     if (err.status) throw err;
     console.error('receipt parse failed:', err);
     throw httpError(502, 'We could not read that document. Please try a clearer photo.');
   }
-  if (parsed.length === 0) throw httpError(422, 'That does not look like a receipt or invoice.');
+  if (parsed.length === 0) {
+    await refund(req.userId, 'scans');
+    throw httpError(422, 'That does not look like a receipt or invoice.');
+  }
 
   const stored = await saveReceipt({ userId: req.userId, business, fileName, buffer, mediaType });
 

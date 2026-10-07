@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { requirePaid } from '../lib/plans.js';
 import { requireAuth } from '../lib/auth.js';
 import { buildAuthUrl, completeAuth, verifyState, returnToFromState, disconnectDropbox } from '../lib/dropbox.js';
 
@@ -31,9 +32,11 @@ function backToApp(result, returnTo) {
 // the system browser.
 dropboxAuthRouter.get('/auth/dropbox/start', requireAuth, async (req, res) => {
   try {
+    await requirePaid(req.userId, 'dropbox');
     const url = await buildAuthUrl(req.userId, currentSite(req));
     res.json({ url });
   } catch (err) {
+    if (err.status === 402) return res.status(402).json({ error: err.message, ...(err.extra || {}) });
     console.error('dropbox start error', err);
     res.status(500).json({ error: 'Could not start Dropbox connection' });
   }

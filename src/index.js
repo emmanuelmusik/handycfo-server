@@ -7,6 +7,7 @@ import { receiptsRouter } from './routes/receipts.js';
 import { networkRouter } from './routes/network.js';
 import { accountRouter } from './routes/account.js';
 import { invoicesRouter } from './routes/invoices.js';
+import { plansRouter } from './routes/plans.js';
 import { runReminderJob } from './jobs/sendInvoiceReminders.js';
 
 const app = express();
@@ -23,6 +24,7 @@ app.use(dropboxAuthRouter);
 app.use(receiptsRouter);
 app.use(networkRouter);
 app.use(invoicesRouter);
+app.use(plansRouter);
 app.use(accountRouter);
 
 // Manual trigger for testing/observability — e.g. an uptime pinger,
