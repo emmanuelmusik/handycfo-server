@@ -9,6 +9,8 @@ create table if not exists public.app_settings (
   value text not null
 );
 insert into public.app_settings (key, value) values ('plans_enforced', 'false') on conflict (key) do nothing;
+-- Accounts listed here (comma separated emails) have no limits at all, in every app screen and on the server.
+insert into public.app_settings (key, value) values ('unlimited_emails', 'emmanuelmusik7@gmail.com') on conflict (key) do nothing;
 alter table public.app_settings enable row level security; -- no policies: server only
 
 -- One row per paying user. No row (or an expired one) means the Free plan.
@@ -88,10 +90,13 @@ language plpgsql
 security definer
 set search_path = public
 as $$
-declare v_plan text; v_end timestamptz; v_max integer; v_count integer; v_on text;
+declare v_plan text; v_end timestamptz; v_max integer; v_count integer; v_on text; v_email text; v_list text;
 begin
   select value into v_on from app_settings where key = 'plans_enforced';
   if coalesce(v_on, 'false') <> 'true' then return new; end if;
+  select lower(email) into v_email from auth.users where id = new.owner_id;
+  select value into v_list from app_settings where key = 'unlimited_emails';
+  if v_email is not null and v_email = any (string_to_array(lower(replace(coalesce(v_list, ''), ' ', '')), ',')) then return new; end if;
   select plan, current_period_end into v_plan, v_end from subscriptions where user_id = new.owner_id;
   if v_plan is null or v_plan = 'free' or (v_end is not null and v_end < now()) then v_max := 1; else v_max := 3; end if;
   select count(*) into v_count from businesses where owner_id = new.owner_id;

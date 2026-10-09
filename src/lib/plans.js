@@ -19,12 +19,33 @@ export async function plansEnforced() {
   return enforcedCache.value;
 }
 
+// Accounts listed in app_settings.unlimited_emails (comma separated) have no limits.
+let ownerCache = new Map();
+export async function isUnlimited(userId) {
+  const hit = ownerCache.get(userId);
+  if (hit && Date.now() - hit.at < 300_000) return hit.value;
+  let value = false;
+  try {
+    const [{ data: setting }, { data: u }] = await Promise.all([
+      supabaseAdmin.from('app_settings').select('value').eq('key', 'unlimited_emails').maybeSingle(),
+      supabaseAdmin.auth.admin.getUserById(userId),
+    ]);
+    const list = String(setting?.value || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean);
+    value = !!u?.user?.email && list.includes(u.user.email.toLowerCase());
+  } catch { /* treat as a normal account */ }
+  ownerCache.set(userId, { at: Date.now(), value });
+  return value;
+}
+
 export function isActivePaid(sub, now = new Date()) {
   if (!sub || sub.plan === 'free') return false;
   return !sub.current_period_end || new Date(sub.current_period_end) > now;
 }
 
 export async function getPlan(userId) {
+  if (await isUnlimited(userId)) {
+    return { plan: 'owner', paid: true, isTrial: false, periodEnd: null, unlimited: true, limits: { businesses: null, invoices: null, scans: null } };
+  }
   const { data: sub } = await supabaseAdmin.from('subscriptions').select('*').eq('user_id', userId).maybeSingle();
   const paid = isActivePaid(sub);
   return {
