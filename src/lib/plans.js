@@ -4,7 +4,7 @@ import { httpError } from './ownership.js';
 // What each plan includes. Free is capped; Monthly and Quarterly are the same plan billed differently.
 export const LIMITS = {
   free: { businesses: 1, invoices: 5, scans: 10 },
-  paid: { businesses: 3, invoices: null, scans: 150 }, // null = unlimited
+  paid: { businesses: 3, invoices: null, scans: 100 }, // null = unlimited
 };
 
 const KIND_LABEL = { scans: 'receipt scans', invoices: 'invoices' };
