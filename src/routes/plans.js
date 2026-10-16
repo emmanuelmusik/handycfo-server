@@ -36,7 +36,12 @@ function secretOk(header) {
 // In RevenueCat: set the app user id to the person's HandyCFO user id, and add this URL as a
 // webhook with the Authorization header "Bearer <REVENUECAT_WEBHOOK_SECRET>".
 plansRouter.post('/webhooks/revenuecat', route(async (req, res) => {
-  if (!secretOk(req.headers.authorization)) throw httpError(401, 'Unauthorized');
+  if (!secretOk(req.headers.authorization)) {
+    // Safe diagnostics only (no secret values): helps spot a missing or mistyped header in RevenueCat.
+    const h = String(req.headers.authorization || '');
+    console.warn(`RevenueCat webhook refused: header ${h ? `present, ${h.length} chars, starts with "${h.slice(0, 7)}"` : 'missing'}; server secret ${process.env.REVENUECAT_WEBHOOK_SECRET ? `set, ${process.env.REVENUECAT_WEBHOOK_SECRET.length} chars` : 'NOT SET'}`);
+    throw httpError(401, 'Unauthorized');
+  }
   const ev = req.body?.event || {};
   const userId = ev.app_user_id;
   if (!UUID_RE.test(String(userId || ''))) return res.json({ ignored: 'not a HandyCFO user id' });
