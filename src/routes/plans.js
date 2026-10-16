@@ -32,6 +32,34 @@ function secretOk(header) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+// Asks RevenueCat directly what the signed-in person has bought, so a late or missed webhook can never
+// leave a paying customer on Free. Only ever asks about the caller's own id.
+plansRouter.post('/plan/sync', requireAuth, route(async (req, res) => {
+  const key = process.env.REVENUECAT_PUBLIC_KEY;
+  if (!key) throw httpError(503, 'Store sync is not set up yet');
+  const r = await fetch(`https://api.revenuecat.com/v1/subscribers/${encodeURIComponent(req.userId)}`, {
+    headers: { Authorization: `Bearer ${key}`, 'X-Platform': 'ios', Accept: 'application/json' },
+  });
+  if (!r.ok) throw httpError(502, `Store lookup failed (${r.status})`);
+  const subs = (await r.json())?.subscriber?.subscriptions || {};
+  const now = Date.now();
+  let best = null;
+  for (const [productId, sub] of Object.entries(subs)) {
+    const exp = sub?.expires_date ? Date.parse(sub.expires_date) : null;
+    const plan = planFromProduct(productId);
+    if (!plan || !exp || exp <= now) continue;
+    if (!best || exp > best.exp) best = { plan, exp, trial: sub.period_type === 'trial' };
+  }
+  if (best) {
+    const { error } = await supabaseAdmin.from('subscriptions').upsert(
+      { user_id: req.userId, provider: 'revenuecat', plan: best.plan, status: 'active', is_trial: best.trial, current_period_end: new Date(best.exp).toISOString(), updated_at: new Date().toISOString() },
+      { onConflict: 'user_id' }
+    );
+    if (error) throw new Error(error.message);
+  }
+  res.json({ synced: !!best, plan: best?.plan || null });
+}));
+
 // RevenueCat tells us when someone subscribes, renews, cancels or lets it lapse.
 // In RevenueCat: set the app user id to the person's HandyCFO user id, and add this URL as a
 // webhook with the Authorization header "Bearer <REVENUECAT_WEBHOOK_SECRET>".
