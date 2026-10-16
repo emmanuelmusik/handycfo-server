@@ -20,11 +20,13 @@ app.use(cors({ origin: allowedOrigins.length ? allowedOrigins : true }));
 
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 
+// Plans (and the RevenueCat webhook) first: the routers below apply sign-in to every path that reaches them,
+// which would turn the webhook away with 401 before its own secret check ever ran.
+app.use(plansRouter);
 app.use(dropboxAuthRouter);
 app.use(receiptsRouter);
 app.use(networkRouter);
 app.use(invoicesRouter);
-app.use(plansRouter);
 app.use(accountRouter);
 
 // Manual trigger for testing/observability — e.g. an uptime pinger,
